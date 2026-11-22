@@ -1,0 +1,37 @@
+Classical CV approaches to LISA usually were 2 stage:
+1. ROI extraction
+2. Classification
+
+ROI extraction has 3 main approaches:
+1. HOG - histogram of gradients
+2. ICF - integral channel features
+3. ACF - aggregate channel features
+
+HOG is for grayscale images, and most signs are colored so its weaker than other 2 methods
+* Does ok on speed limit signs since these are black and white
+
+ACF usually beats ICF, since ACF is and extension of ICF that uses feature pyramids
+* ICF is specificly weak on the speed limit signs, which lack lots of the color information
+Allows ACF to reduce the amount of Haar recomputation, thus faster with about the same accuracy
+
+Thus - use ACF as the main ROI detection approach
+
+Classification approaches
+* Cascade classifier seems to be better than SVM
+
+
+
+State of the Art are Deep learning based approaches
+
+Of note are the preprocessing steps
+
+Step	Why it shows up on LISA
+Drop grayscale frames - Color models; superclasses use color
+Keep only frequent classes (8–16) or merge to 3 superclasses - 47 classes, long tail
+Crop signs or letterbox whole frames - Tiny objects vs detector input size
+Resize (32×32, 256×256, 400×260, 640×640) - Fixed tensor size
+Contrast / CLAHE - Illumination in driving video
+Track-aware train/test split - Consecutive frames leak
+Light aug (rotate, noise) or GAN night - Class imbalance / domain shift
+
+
