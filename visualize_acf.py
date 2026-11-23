@@ -25,6 +25,7 @@ from matplotlib.patches import Rectangle
 from acf import (
     CHANNEL_NAMES,
     AcfChannels,
+    clahe_bgr,
     extract_acf,
     heatmap_on_image,
     template_heatmap,
@@ -336,6 +337,7 @@ def main() -> None:
 
     data = LISACocoDataset(split=args.split, color="bgr")
     bgr, anns, image_id = _pick_example(data, args.image_id, args.min_box)
+    bgr = clahe_bgr(bgr)
     rgb = _bgr_to_rgb(bgr)
     acf = extract_acf(bgr, shrink=args.shrink)
 

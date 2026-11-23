@@ -12,27 +12,17 @@ Detection slides that fixed window over a **scale pyramid**, then NMS.
 A 16×16-cell model is only ~32×32 px at shrink=2; without the pyramid
 every predicted box is that size (~¼ of a typical LISA sign) and the
 true sign is never the right template, so high scores land on random
-32×32 patches. Cascade is still off (``cascade_tau is None``).
+32×32 patches. After boosting, ``calibrate_cascade`` fills ``cascade_tau``
+so ``score_windows`` can drop dead background before later trees.
 
-How the two omitted pieces plug in
-----------------------------------
+How the two extra pieces plug in
+--------------------------------
 **Soft cascade** (Bourdev–Brandt / Dollár "constant soft cascade")
-    The sum is already ordered: after tree ``t`` you have a partial score
-    ``F_t(x)``. Almost every background window is already terrible after a
-    handful of trees. Calibration sets a threshold ``τ[t]`` so that nearly
-    all *positives* still satisfy ``F_t(x) ≥ τ[t]``, then at test time::
-
-        F = 0
-        for t, f_t in stages:
-            F += f_t(x)
-            if F < tau[t]:
-                return reject     # do not evaluate remaining trees
-
-    Integration point: ``BoostedAcf.score_windows`` would take an optional
-    ``tau`` vector and skip rows of the batch whose running sum is below
-    ``tau[t]``. Training does not change. ``tau`` is chosen on a validation
-    set (or as a straight line ``τ[t] = a + b*t``). This file leaves ``tau``
-    as None, so every window runs the full forest.
+    After boosting, ``calibrate_cascade`` sets ``τ[t]`` from the
+    ``pos_recall``-quantile of ``F_t`` on held-out positives, then (by
+    default) a linear envelope ``a + b t`` that never exceeds that quantile.
+    ``score_windows`` drops a window once ``F_t(x) < τ[t]`` and does not
+    revive it. Tree training is unchanged.
 
 **Scale pyramid** (Dollár "fast feature pyramids", the rest of ACF)
     The model window is a *canonical size* (here 16×16 cells ≈ 32×32 px at
@@ -45,11 +35,9 @@ How the two omitted pieces plug in
             box_full = (x, y, win_w, win_h) * shrink / scale
 
     Computing 10 channels at every scale is expensive. ACF's trick is to
-    compute channels only at a few octaves and *approximate* the in-between
-    scales by resampling the channel maps (not the RGB). That is the "fast
-    feature pyramid." Integration point: ``detect_image`` would loop scales
-    and concatenate boxes before NMS. ``detect_image`` now builds that
-    pyramid by default (``scales=None``).
+    compute channels once (or at a few octaves) and *approximate* the other
+    scales by resampling the aggregated maps. ``detect_image`` does that by
+    default (``fast_pyramid=True``).
 
 Neither piece changes the tree learner. Cascade is an early-exit on the
 score; the pyramid is the same score on resampled channels.
@@ -65,7 +53,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import cv2
 import numpy as np
 
-from acf import crop_aggregated_box, extract_acf, heatmap_on_image, resize_patch
+from acf import (
+    clahe_bgr,
+    crop_aggregated_box,
+    extract_acf,
+    heatmap_on_image,
+    resize_aggregated,
+    resize_patch,
+)
 from lisa_coco import iou
 
 EPS = 1e-6
@@ -407,6 +402,23 @@ def _fit_quant_tree(
     )
 
 
+def _window_grad_l2(
+    aggregated: np.ndarray,
+    win_h: int,
+    win_w: int,
+    origin_y: np.ndarray,
+    origin_x: np.ndarray,
+) -> np.ndarray:
+    """Per-window L2 of the 7 gradient channels, matching ``windows_to_features``."""
+    energy = np.sum(aggregated[..., 3:] ** 2, axis=2)
+    integ = np.pad(energy, ((1, 0), (1, 0)), mode="constant")
+    integ = np.cumsum(np.cumsum(integ, axis=0), axis=1)
+    y1 = origin_y + int(win_h)
+    x1 = origin_x + int(win_w)
+    ss = integ[y1, x1] - integ[origin_y, x1] - integ[y1, origin_x] + integ[origin_y, origin_x]
+    return np.sqrt(np.maximum(ss, 0.0)).astype(np.float32) + 1e-4
+
+
 @dataclass
 class BoostedAcf:
     """RealBoost forest over a fixed-size ACF window.
@@ -420,7 +432,7 @@ class BoostedAcf:
     shrink: int
     depth: int
     stages: List[Tuple[Any, np.ndarray]] = field(default_factory=list)
-    # Reserved for a soft cascade. None → evaluate every tree on every window.
+    # Soft cascade. None → evaluate every tree on every window.
     cascade_tau: Optional[np.ndarray] = None
     history: List[Dict[str, float]] = field(default_factory=list)
     max_features: MaxFeatures = 256
@@ -438,22 +450,18 @@ class BoostedAcf:
     def score_windows(self, x: np.ndarray) -> np.ndarray:
         """Score a batch of flattened windows, shape (N, n_features).
 
-        If ``cascade_tau`` were set, this is where you would do::
-
-            alive = ones(N, bool)
-            for t, (tree, values) in enumerate(self.stages):
-                leaves = tree.apply(x[alive])
-                scores[alive] += values[leaves]
-                alive = scores >= self.cascade_tau[t]
-                if not alive.any():
-                    break
-
-        Without ``tau``, every window gets the full sum (correct, slower).
+        With ``cascade_tau``, a window that falls below ``τ[t]`` after tree
+        ``t`` is dropped and never revived (partial sum is the returned score).
+        Without ``tau``, every window gets the full sum.
         """
         x = np.asarray(x, dtype=np.float32)
         if x.ndim == 1:
             x = x.reshape(1, -1)
         scores = np.zeros(x.shape[0], dtype=np.float64)
+        if self.cascade_tau is None:
+            for tree, values in self.stages:
+                scores += values[tree.apply(x)]
+            return scores.astype(np.float32)
         alive = np.ones(x.shape[0], dtype=bool)
         for t, (tree, values) in enumerate(self.stages):
             if not np.any(alive):
@@ -461,39 +469,90 @@ class BoostedAcf:
             idx = np.flatnonzero(alive)
             leaves = tree.apply(x[idx])
             scores[idx] += values[leaves]
-            if self.cascade_tau is not None:
-                alive = scores >= float(self.cascade_tau[t])
+            alive[idx] = scores[idx] >= float(self.cascade_tau[t])
         return scores.astype(np.float32)
+
+    def _apply_tree_on_map(
+        self,
+        tree: QuantTree,
+        aggregated: np.ndarray,
+        origin_y: np.ndarray,
+        origin_x: np.ndarray,
+        grad_norm: np.ndarray,
+    ) -> np.ndarray:
+        """Walk ``tree`` on sliding windows without copying patches."""
+        n = int(origin_y.shape[0])
+        node = np.zeros(n, dtype=np.int32)
+        tw = int(self.win_w)
+        n_ch = 10
+        for _ in range(tree.depth + 1):
+            feat = tree.feature[node]
+            leaf = feat < 0
+            if np.all(leaf):
+                break
+            safe = np.where(leaf, 0, feat)
+            fy = safe // (tw * n_ch)
+            fx = (safe // n_ch) % tw
+            fc = safe % n_ch
+            vals = aggregated[origin_y + fy, origin_x + fx, fc]
+            color = fc < 3
+            feat_val = np.where(color, vals / 100.0, vals / grad_norm)
+            go_left = feat_val <= tree.threshold[node]
+            nxt = np.where(go_left, tree.left[node], tree.right[node])
+            node = np.where(leaf, node, nxt)
+        return node
 
     def score_heatmap(
         self,
         aggregated: np.ndarray,
-        stride: int = 2,
+        stride: int = 4,
         scale: float = 1.0,
     ) -> np.ndarray:
-        """Slide the model window over one aggregated map (one pyramid level)."""
-        del scale  # used only when mapping boxes back in detect_image
+        """Slide the model window over one aggregated map (one pyramid level).
+
+        Looks up ACF cells on the map (same layout as ``windows_to_features``)
+        instead of allocating a (win, win, 10) crop per location.
+        """
+        del scale
         h, w, _ = aggregated.shape
-        th, tw = self.win_h, self.win_w
+        th, tw = int(self.win_h), int(self.win_w)
         if h < th or w < tw:
             return np.zeros((0, 0), dtype=np.float32)
-        out_h = (h - th) // stride + 1
-        out_w = (w - tw) // stride + 1
-        heat = np.zeros((out_h, out_w), dtype=np.float32)
-        xs = np.arange(0, w - tw + 1, stride)
-        for iy, y in enumerate(range(0, h - th + 1, stride)):
-            band = aggregated[y : y + th]
-            patches = np.stack(
-                [band[:, x : x + tw, :] for x in xs],
-                axis=0,
-            )
-            heat[iy] = self.score_windows(windows_to_features(patches))
-        return heat
+        ys = np.arange(0, h - th + 1, stride, dtype=np.int32)
+        xs = np.arange(0, w - tw + 1, stride, dtype=np.int32)
+        out_h, out_w = int(ys.size), int(xs.size)
+        origin_y = np.repeat(ys, out_w)
+        origin_x = np.tile(xs, out_h)
+        grad_norm = _window_grad_l2(aggregated, th, tw, origin_y, origin_x)
+        n = int(origin_y.shape[0])
+        scores = np.zeros(n, dtype=np.float64)
+        if self.cascade_tau is None:
+            for tree, values in self.stages:
+                node = self._apply_tree_on_map(
+                    tree, aggregated, origin_y, origin_x, grad_norm
+                )
+                scores += values[node]
+        else:
+            alive = np.ones(n, dtype=bool)
+            for t, (tree, values) in enumerate(self.stages):
+                if not np.any(alive):
+                    break
+                idx = np.flatnonzero(alive)
+                node = self._apply_tree_on_map(
+                    tree,
+                    aggregated,
+                    origin_y[idx],
+                    origin_x[idx],
+                    grad_norm[idx],
+                )
+                scores[idx] += values[node]
+                alive[idx] = scores[idx] >= float(self.cascade_tau[t])
+        return scores.astype(np.float32).reshape(out_h, out_w)
 
     def detect_image(
         self,
         bgr: np.ndarray,
-        stride: int = 2,
+        stride: int = 4,
         score_threshold: float = 0.0,
         nms_iou: float = 0.3,
         scales: Optional[Sequence[float]] = None,
@@ -502,17 +561,22 @@ class BoostedAcf:
         peaks_per_scale: int = 80,
         return_heat: bool = True,
         refine: bool = True,
+        preprocess: bool = True,
+        fast_pyramid: bool = True,
     ) -> Tuple[List[Tuple[float, float, float, float]], List[float], np.ndarray]:
         """Run the forest as a sliding-window detector over a scale pyramid.
 
         ``scale`` resizes the *image* so a sign of size ``model_px / scale``
         matches the trained window. Boxes are mapped back with
         ``(cell * shrink) / scale``. ``scales=None`` uses ``pyramid_scales``.
-        Peaks are local maxima. After NMS, keep scores ≥ ``score_threshold``
-        (and ≥ ``score_ratio`` of the image max if that is > 0). ``refine``
-        shrinks each square onto saturated pixels so IoU vs a non-square GT
-        plate is not capped at ~0.5.
+        With ``fast_pyramid`` (default), ACF is computed once at full
+        resolution and other scales resample the aggregated maps. Peaks are
+        local maxima. After NMS, keep scores ≥ ``score_threshold`` (and ≥
+        ``score_ratio`` of the image max if that is > 0). ``refine`` shrinks
+        each square onto saturated pixels. ``preprocess`` runs CLAHE on L.
         """
+        if preprocess:
+            bgr = clahe_bgr(bgr)
         if scales is None:
             # Bias toward shrinking the frame: LISA signs in this export are
             # usually larger than the 32 px training window.
@@ -520,31 +584,48 @@ class BoostedAcf:
                 self.win_h * self.shrink,
                 min_object_px=24.0,
                 max_object_px=220.0,
-                step=1.15,
+                step=1.3,
             )
 
         all_boxes: List[Tuple[float, float, float, float]] = []
         all_scores: List[float] = []
         heat_display = np.zeros((bgr.shape[0], bgr.shape[1]), dtype=np.float32)
+        min_side = max(self.win_h, self.win_w) * self.shrink
+        base_agg = None
+        if fast_pyramid:
+            base_agg = extract_acf(bgr, shrink=self.shrink).aggregated
 
         for scale in scales:
             new_w = max(1, int(round(bgr.shape[1] * scale)))
             new_h = max(1, int(round(bgr.shape[0] * scale)))
-            min_side = max(self.win_h, self.win_w) * self.shrink
             if new_w < min_side or new_h < min_side:
                 continue
-            if abs(scale - 1.0) < 1e-6:
-                image = bgr
+            agg_h = max(1, new_h // self.shrink)
+            agg_w = max(1, new_w // self.shrink)
+            if agg_h < self.win_h or agg_w < self.win_w:
+                continue
+            if fast_pyramid:
+                if abs(scale - 1.0) < 1e-6:
+                    aggregated = base_agg
+                else:
+                    aggregated = resize_aggregated(base_agg, agg_h, agg_w)
+                image_shape = (new_h, new_w)
             else:
-                image = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            acf = extract_acf(image, shrink=self.shrink)
-            heat = self.score_heatmap(acf.aggregated, stride=stride, scale=scale)
+                if abs(scale - 1.0) < 1e-6:
+                    image = bgr
+                else:
+                    image = cv2.resize(
+                        bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR
+                    )
+                aggregated = extract_acf(image, shrink=self.shrink).aggregated
+                image_shape = image.shape[:2]
+            heat = self.score_heatmap(aggregated, stride=stride, scale=scale)
             if heat.size == 0:
                 continue
             if return_heat:
                 mapped = heatmap_on_image(
                     heat,
-                    (image.shape[0], image.shape[1]),
+                    image_shape,
                     self.win_h,
                     self.win_w,
                     self.shrink,
@@ -713,6 +794,7 @@ def fit_realboost(
         model.max_features = max_features
         model.row_frac = row_frac
         model.n_bins = n_bins
+        model.cascade_tau = None
         scores = model.score_windows(x).astype(np.float64)
         val_scores = (
             model.score_windows(x_val).astype(np.float64) if has_val else None
@@ -795,6 +877,93 @@ def fit_realboost(
                 )
             print(msg, flush=True)
     return model
+
+
+def calibrate_cascade(
+    model: BoostedAcf,
+    x: np.ndarray,
+    y: np.ndarray,
+    pos_recall: float = 0.995,
+    linear: bool = True,
+    slack: float = 1e-3,
+) -> np.ndarray:
+    """Fill ``model.cascade_tau`` from running scores on labeled windows.
+
+    After tree ``t``, ``τ[t]`` is the ``(1 - pos_recall)`` quantile of
+    ``F_t`` on positives (default: keep 99.5%). If ``linear``, those
+    quantiles are replaced by a least-squares line ``a + b t`` clipped
+    *above* so ``τ`` never exceeds the quantile (Dollár's constant soft
+    cascade, without extra positive kills).
+
+    Call this *after* boosting. ``fit_realboost`` clears ``cascade_tau``
+    so continuation rounds see full residuals.
+    """
+    if model.n_trees < 1:
+        model.cascade_tau = None
+        return np.zeros((0,), dtype=np.float32)
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    pos = y > 0
+    neg = y < 0
+    n_pos = int(np.count_nonzero(pos))
+    if n_pos < 2:
+        raise ValueError("calibrate_cascade needs at least 2 positive windows")
+    pos_recall = float(np.clip(pos_recall, 0.5, 0.9999))
+    q = 100.0 * (1.0 - pos_recall)
+    x_pos = x[pos]
+    scores = np.zeros(n_pos, dtype=np.float64)
+    tau_raw = np.zeros(model.n_trees, dtype=np.float64)
+
+    for t, (tree, values) in enumerate(model.stages):
+        scores += values[tree.apply(x_pos)]
+        tau_raw[t] = float(np.percentile(scores, q)) - slack
+
+    tau = tau_raw.copy()
+    if linear and model.n_trees >= 2:
+        t_idx = np.arange(model.n_trees, dtype=np.float64)
+        design = np.stack([np.ones(model.n_trees), t_idx], axis=1)
+        coef, *_ = np.linalg.lstsq(design, tau_raw, rcond=None)
+        tau = np.minimum(tau_raw, coef[0] + coef[1] * t_idx)
+
+    model.cascade_tau = tau.astype(np.float32)
+
+    scores = np.zeros(n_pos, dtype=np.float64)
+    alive_pos = np.ones(n_pos, dtype=bool)
+    alive_neg_frac: List[float] = []
+    scores_neg = None
+    alive_neg = None
+    if np.any(neg):
+        x_neg = x[neg]
+        scores_neg = np.zeros(int(np.count_nonzero(neg)), dtype=np.float64)
+        alive_neg = np.ones(scores_neg.shape[0], dtype=bool)
+    for t, (tree, values) in enumerate(model.stages):
+        scores += values[tree.apply(x_pos)]
+        alive_pos &= scores >= tau[t]
+        if scores_neg is not None and alive_neg is not None:
+            idx = np.flatnonzero(alive_neg)
+            scores_neg[idx] += values[tree.apply(x_neg[idx])]
+            alive_neg[idx] = scores_neg[idx] >= tau[t]
+            alive_neg_frac.append(float(np.mean(alive_neg)))
+
+    print(
+        f"  cascade  stages={model.n_trees}  pos_recall_target={pos_recall:.4f}  "
+        f"linear={linear}  tau[0]={tau[0]:.3f}  "
+        f"tau[{model.n_trees // 2}]={tau[model.n_trees // 2]:.3f}  "
+        f"tau[-1]={tau[-1]:.3f}  "
+        f"calib-pos surviving all stages={float(np.mean(alive_pos)):.3f}",
+        flush=True,
+    )
+    if alive_neg_frac:
+        checkpoints = sorted(
+            {0, min(9, len(alive_neg_frac) - 1), len(alive_neg_frac) - 1}
+        )
+        bits = ", ".join(
+            f"t{i + 1}:{alive_neg_frac[i]:.3f}" for i in checkpoints
+        )
+        print(f"  cascade  val-neg still alive  {bits}", flush=True)
+    return model.cascade_tau
 
 
 def window_from_box(
@@ -1022,8 +1191,8 @@ def collect_windows(
     """Positives = canonical squares (same ACF path as detection).
 
     Negatives = exact ``win×win`` cell slices on ``extract_acf(bgr, shrink)``,
-    i.e. scale=1 sliding windows. Do **not** downsample RGB first: that made
-    train features a different Sobel than ``detect_image``.
+    i.e. scale=1 sliding windows. CLAHE (LAB L) runs once on the full frame
+    before ACF, matching ``detect_image``. Do **not** downsample RGB first.
     """
     xs: List[np.ndarray] = []
     ys: List[int] = []
@@ -1043,6 +1212,7 @@ def collect_windows(
                     flush=True,
                 )
             continue
+        bgr = clahe_bgr(bgr)
         acf = extract_acf(bgr, shrink=shrink)
         inv = 1.0 / float(shrink)
         gt_cell = [_scale_box(ann["bbox"], inv) for ann in anns]
@@ -1112,6 +1282,7 @@ def hard_negatives(
         bgr, anns, _image_id = dataset.get(int(index))
         if colorfulness(bgr) < min_color:
             continue
+        bgr = clahe_bgr(bgr)
         gt = [ann["bbox"] for ann in anns]
         boxes, _scores, _heat = model.detect_image(
             bgr,
@@ -1121,6 +1292,7 @@ def hard_negatives(
             max_boxes=max(per_image * 3, 8),
             return_heat=False,
             refine=False,
+            preprocess=False,
             scales=pyramid_scales(
                 model.win_h * model.shrink,
                 min_object_px=32.0,

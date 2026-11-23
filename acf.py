@@ -7,6 +7,7 @@ The published detector then trains RealBoost over these lookups
 Pipeline
 --------
     BGR frame
+      -> CLAHE on LAB lightness (once, full frame; see ``clahe_bgr``)
       -> 10 registered channels (same H x W as the image)
            3 LUV color
            1 gradient magnitude
@@ -64,6 +65,34 @@ class AcfChannels:
     @property
     def names(self) -> List[str]:
         return list(CHANNEL_NAMES)
+
+
+def clahe_bgr(
+    bgr: np.ndarray,
+    clip_limit: float = 2.0,
+    tile_size: int = 8,
+) -> np.ndarray:
+    """Local contrast equalization on lightness only (LAB L channel).
+
+    LISA frames vary a lot in sun/shadow; there is no other color
+    normalization before ACF. CLAHE on L leaves a/b (opponent color) so
+    red/yellow plates keep their hue. Apply **once** on the full camera
+    frame, then crop / pyramid / ACF, so train windows and ``detect_image``
+    share the same tiles.
+    """
+    img = np.asarray(bgr)
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError("expected a BGR image with shape (H, W, 3)")
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    lightness, a_ch, b_ch = cv2.split(lab)
+    equalizer = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=(int(tile_size), int(tile_size)),
+    )
+    merged = cv2.merge([equalizer.apply(lightness), a_ch, b_ch])
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 
 def bgr_to_luv(bgr: np.ndarray) -> np.ndarray:
@@ -132,13 +161,19 @@ def orientation_channels(
     bin1 = (bin0 + 1) % n_bins
     alpha = coord - np.floor(coord)
 
-    out = np.zeros((h * w, n_bins), dtype=np.float32)
-    pix = np.arange(h * w)
-    mag = magnitude.reshape(-1)
-    a = alpha.reshape(-1).astype(np.float32)
-    np.add.at(out, (pix, bin0.reshape(-1)), mag * (1.0 - a))
-    np.add.at(out, (pix, bin1.reshape(-1)), mag * a)
-    return out.reshape(h, w, n_bins)
+    mag = magnitude.astype(np.float32)
+    a = alpha.astype(np.float32)
+    w0 = mag * (1.0 - a)
+    w1 = mag * a
+    out = np.zeros((n_bins, h, w), dtype=np.float32)
+    for k in range(n_bins):
+        m0 = bin0 == k
+        m1 = bin1 == k
+        if np.any(m0):
+            out[k][m0] = w0[m0]
+        if np.any(m1):
+            out[k][m1] += w1[m1]
+    return np.transpose(out, (1, 2, 0))
 
 
 def compute_full_channels(bgr: np.ndarray) -> np.ndarray:
@@ -213,6 +248,25 @@ def extract_acf(bgr: np.ndarray, shrink: int = 2) -> AcfChannels:
     full = compute_full_channels(bgr)
     aggregated = aggregate_channels(full, shrink=shrink)
     return AcfChannels(full=full, aggregated=aggregated, shrink=shrink)
+
+
+def resize_aggregated(
+    aggregated: np.ndarray,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray:
+    """Resize an aggregated (h, w, C) map. Used for fast feature pyramids."""
+    h, w, n_ch = aggregated.shape
+    if out_h < 1 or out_w < 1:
+        raise ValueError("aggregated resize must be at least 1x1")
+    if h == out_h and w == out_w:
+        return aggregated
+    interp = cv2.INTER_AREA if (out_h < h or out_w < w) else cv2.INTER_LINEAR
+    channels = [
+        cv2.resize(aggregated[:, :, c], (out_w, out_h), interpolation=interp)
+        for c in range(n_ch)
+    ]
+    return np.stack(channels, axis=2).astype(np.float32)
 
 
 def window_vector(

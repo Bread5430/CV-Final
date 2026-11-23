@@ -35,3 +35,4 @@ Track-aware train/test split - Consecutive frames leak
 Light aug (rotate, noise) or GAN night - Class imbalance / domain shift
 
 
+https://www.sciencedirect.com/science/article/pii/S1877050924009311

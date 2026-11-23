@@ -14,7 +14,9 @@ Pipeline
 5. Bootstrap: run the *same* scale pyramid as test, take false-positive
    boxes, resize them into the model window, add as negatives, **continue**
    boosting (do not throw away earlier trees).
-6. Detect on 10 random test frames; write ROI grid + convergence plot.
+6. Soft cascade: set ``τ[t]`` from val-positive running scores (keep
+   ``--cascade-recall`` of them), optionally a linear envelope.
+7. Detect on 10 random test frames; write ROI grid + convergence plot.
 
     python train_acf.py
     python train_acf.py --eval-only --n-show 10
@@ -41,6 +43,7 @@ from matplotlib.patches import Rectangle
 
 from acf_boost import (
     BoostedAcf,
+    calibrate_cascade,
     collect_windows,
     colorfulness,
     evaluate_detection,
@@ -119,12 +122,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not write a windows cache after collection.",
     )
+    p.add_argument(
+        "--cascade-recall",
+        type=float,
+        default=0.995,
+        help="Fraction of val positives that must pass each cascade stage.",
+    )
+    p.add_argument(
+        "--no-cascade",
+        action="store_true",
+        help="Skip τ calibration; every window runs every tree.",
+    )
     p.add_argument("--eval-only", action="store_true", help="Load acf_boosted.pkl; skip training.")
     p.add_argument("--n-show", type=int, default=10, help="Random test images to draw.")
     return p.parse_args()
 
 
-WINDOWS_CACHE_VERSION = 2
+WINDOWS_CACHE_VERSION = 3
 
 
 def default_windows_path(out_dir: str, args: argparse.Namespace) -> str:
@@ -150,6 +164,7 @@ def _windows_meta(
         "eval_images": int(args.eval_images),
         "jitter_per_gt": 1,
         "feat_norm": "luv_raw_grad_l2",
+        "clahe": True,
         "n_train_images": int(n_train),
         "n_det_images": int(n_det),
     }
@@ -166,6 +181,7 @@ def _meta_mismatches(meta: Dict[str, Any], expected: Dict[str, Any]) -> List[str
         "eval_images",
         "jitter_per_gt",
         "feat_norm",
+        "clahe",
     )
     return [k for k in keys if meta.get(k) != expected.get(k)]
 
@@ -486,7 +502,7 @@ def train_model(
         return evaluate_detection(
             model,
             det_frames,
-            stride=2,
+            stride=4,
             score_threshold=0.0,
             score_ratio=0.0,
             max_boxes=8,
@@ -524,6 +540,22 @@ def train_model(
         model = fit_realboost(
             x_tr, y_tr, n_trees=extra, model=model, **boost_kw
         )
+    if not args.no_cascade:
+        x_cal, y_cal = (x_val, y_val) if len(y_val) else (x_tr, y_tr)
+        n_pos = int(np.sum(y_cal > 0))
+        print(
+            f"calibrating soft cascade on {len(y_cal)} windows "
+            f"({n_pos} positives, recall={args.cascade_recall})...",
+            flush=True,
+        )
+        if n_pos < 2:
+            print("  skip cascade: not enough positives", flush=True)
+        else:
+            calibrate_cascade(
+                model, x_cal, y_cal, pos_recall=args.cascade_recall, linear=True
+            )
+    else:
+        model.cascade_tau = None
     return model
 
 
@@ -558,7 +590,7 @@ def main() -> None:
     for bgr, anns, image_id in frames:
         boxes, scores, _heat = model.detect_image(
             bgr,
-            stride=2,
+            stride=4,
             score_threshold=0.0,
             score_ratio=0.0,
             max_boxes=8,
