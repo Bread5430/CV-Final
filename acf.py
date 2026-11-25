@@ -33,6 +33,8 @@ from typing import List, Sequence, Tuple
 import cv2
 import numpy as np
 
+cv2.ocl.setUseOpenCL(False)
+
 # 10 channel names, in the order Dollár / Nam use: L, U, V, |G|, 6 HOG bins.
 NUM_ORIENTATIONS = 6
 CHANNEL_NAMES: List[str] = [

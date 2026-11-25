@@ -36,8 +36,8 @@ How the two extra pieces plug in
 
     Computing 10 channels at every scale is expensive. ACF's trick is to
     compute channels once (or at a few octaves) and *approximate* the other
-    scales by resampling the aggregated maps. ``detect_image`` does that by
-    default (``fast_pyramid=True``).
+    scales by resampling the aggregated maps. The quality path used by
+    ``AcfBank`` recomputes ACF at every scale (``fast_pyramid=False``).
 
 Neither piece changes the tree learner. Cascade is an early-exit on the
 score; the pyramid is the same score on resampled channels.
@@ -61,7 +61,7 @@ from acf import (
     resize_aggregated,
     resize_patch,
 )
-from lisa_coco import iou
+from lisa_coco import image_colorfulness, iou
 
 EPS = 1e-6
 MaxFeatures = Union[int, float, str, None]
@@ -93,15 +93,16 @@ def windows_to_features(patches: np.ndarray) -> np.ndarray:
 
 def pyramid_scales(
     model_px: int,
-    min_object_px: float = 24.0,
+    min_object_px: float = 12.0,
     max_object_px: float = 220.0,
-    step: float = 1.3,
+    step: float = 1.09,
 ) -> Tuple[float, ...]:
     """Image scales so a sign of ``object_px`` fills the model window.
 
     ``scale = model_px / object_px``. A 120 px sign vs a 32 px window needs
     ``scale ≈ 0.27`` (shrink the frame). Using only ``scale=1`` emits 32 px
-    boxes no matter how large the GT is.
+    boxes no matter how large the GT is. Default ``step=1.09`` is about
+    eight scales per octave (Dollár / Nam).
     """
     scales = []
     obj = float(min_object_px)
@@ -438,6 +439,10 @@ class BoostedAcf:
     max_features: MaxFeatures = 256
     row_frac: float = 0.5
     n_bins: int = 64
+    shape: Optional[str] = None
+    min_object_px: float = 12.0
+    max_object_px: float = 220.0
+    pyramid_step: float = 1.09
 
     @property
     def n_trees(self) -> int:
@@ -552,40 +557,32 @@ class BoostedAcf:
     def detect_image(
         self,
         bgr: np.ndarray,
-        stride: int = 4,
+        stride: int = 2,
         score_threshold: float = 0.0,
-        nms_iou: float = 0.3,
+        nms_iou: float = 0.5,
         scales: Optional[Sequence[float]] = None,
         score_ratio: float = 0.0,
-        max_boxes: int = 8,
+        max_boxes: int = 40,
         peaks_per_scale: int = 80,
         return_heat: bool = True,
-        refine: bool = True,
+        refine: bool = False,
         preprocess: bool = True,
-        fast_pyramid: bool = True,
+        fast_pyramid: bool = False,
     ) -> Tuple[List[Tuple[float, float, float, float]], List[float], np.ndarray]:
         """Run the forest as a sliding-window detector over a scale pyramid.
 
         ``scale`` resizes the *image* so a sign of size ``model_px / scale``
         matches the trained window. Boxes are mapped back with
-        ``(cell * shrink) / scale``. ``scales=None`` uses ``pyramid_scales``.
-        With ``fast_pyramid`` (default), ACF is computed once at full
-        resolution and other scales resample the aggregated maps. Peaks are
-        local maxima. After NMS, keep scores ≥ ``score_threshold`` (and ≥
-        ``score_ratio`` of the image max if that is > 0). ``refine`` shrinks
-        each square onto saturated pixels. ``preprocess`` runs CLAHE on L.
+        ``(cell * shrink) / scale``. ``scales=None`` uses ``pyramid_scales``
+        from this model's height and object-size range. Quality path
+        recomputes ACF at every scale (``fast_pyramid=False``). Peaks are
+        local maxima. After NMS, keep scores ≥ ``score_threshold``.
+        ``refine`` is off: native-aspect windows already match the plate.
         """
         if preprocess:
             bgr = clahe_bgr(bgr)
         if scales is None:
-            # Bias toward shrinking the frame: LISA signs in this export are
-            # usually larger than the 32 px training window.
-            scales = pyramid_scales(
-                self.win_h * self.shrink,
-                min_object_px=24.0,
-                max_object_px=220.0,
-                step=1.3,
-            )
+            scales = self.default_scales()
 
         all_boxes: List[Tuple[float, float, float, float]] = []
         all_scores: List[float] = []
@@ -619,48 +616,33 @@ class BoostedAcf:
                     )
                 aggregated = extract_acf(image, shrink=self.shrink).aggregated
                 image_shape = image.shape[:2]
-            heat = self.score_heatmap(aggregated, stride=stride, scale=scale)
-            if heat.size == 0:
-                continue
             if return_heat:
-                mapped = heatmap_on_image(
-                    heat,
-                    image_shape,
-                    self.win_h,
-                    self.win_w,
-                    self.shrink,
-                    stride=stride,
-                )
-                if mapped.shape[:2] != (bgr.shape[0], bgr.shape[1]):
-                    mapped = cv2.resize(
-                        mapped,
-                        (bgr.shape[1], bgr.shape[0]),
-                        interpolation=cv2.INTER_LINEAR,
+                heat = self.score_heatmap(aggregated, stride=stride, scale=scale)
+                if heat.size:
+                    mapped = heatmap_on_image(
+                        heat,
+                        image_shape,
+                        self.win_h,
+                        self.win_w,
+                        self.shrink,
+                        stride=stride,
                     )
-                heat_display = np.maximum(heat_display, mapped)
-            peaks = heat.copy()
-            peaks[~_local_max_mask(heat)] = -np.inf
-            flat = peaks.reshape(-1)
-            finite = np.isfinite(flat)
-            if not np.any(finite):
-                continue
-            k = min(int(peaks_per_scale), int(np.count_nonzero(finite)))
-            peak_idx = np.argpartition(flat, -k)[-k:]
-            for linear in peak_idx:
-                s = float(flat[int(linear)])
-                if not np.isfinite(s) or s < score_threshold:
-                    continue
-                iy, ix = np.unravel_index(int(linear), heat.shape)
-                box = _xywh_from_cell(
-                    int(ix) * stride,
-                    int(iy) * stride,
-                    self.win_w,
-                    self.win_h,
-                    self.shrink,
-                    scale=scale,
-                )
-                all_boxes.append(box)
-                all_scores.append(s)
+                    if mapped.shape[:2] != (bgr.shape[0], bgr.shape[1]):
+                        mapped = cv2.resize(
+                            mapped,
+                            (bgr.shape[1], bgr.shape[0]),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    heat_display = np.maximum(heat_display, mapped)
+            boxes_s, scores_s = self.peaks_on_aggregated(
+                aggregated,
+                scale=float(scale),
+                stride=stride,
+                score_threshold=score_threshold,
+                peaks_per_scale=peaks_per_scale,
+            )
+            all_boxes.extend(boxes_s)
+            all_scores.extend(scores_s)
 
         keep = nms(all_boxes, all_scores, iou_threshold=nms_iou)
         boxes = [all_boxes[i] for i in keep]
@@ -677,6 +659,73 @@ class BoostedAcf:
             scores = [s for _b, s in filtered]
         return boxes, scores, heat_display
 
+    def default_scales(self) -> Tuple[float, ...]:
+        return pyramid_scales(
+            int(self.win_h * self.shrink),
+            min_object_px=float(getattr(self, "min_object_px", 12.0)),
+            max_object_px=float(getattr(self, "max_object_px", 220.0)),
+            step=float(getattr(self, "pyramid_step", 1.09)),
+        )
+
+    def propose(
+        self,
+        bgr: np.ndarray,
+        max_boxes: int = 40,
+        **detect_kw: Any,
+    ) -> Tuple[List[Tuple[float, float, float, float]], List[float]]:
+        kw = dict(
+            stride=2,
+            score_threshold=0.0,
+            score_ratio=0.0,
+            max_boxes=int(max_boxes),
+            refine=False,
+            return_heat=False,
+            fast_pyramid=False,
+        )
+        kw.update(detect_kw)
+        boxes, scores, _heat = self.detect_image(bgr, **kw)
+        return boxes, scores
+
+    def peaks_on_aggregated(
+        self,
+        aggregated: np.ndarray,
+        scale: float,
+        stride: int = 2,
+        score_threshold: float = 0.0,
+        peaks_per_scale: int = 80,
+    ) -> Tuple[List[Tuple[float, float, float, float]], List[float]]:
+        """Local-max windows on one already-built aggregated map."""
+        heat = self.score_heatmap(aggregated, stride=stride, scale=scale)
+        if heat.size == 0:
+            return [], []
+        peaks = heat.copy()
+        peaks[~_local_max_mask(heat)] = -np.inf
+        flat = peaks.reshape(-1)
+        finite = np.isfinite(flat)
+        if not np.any(finite):
+            return [], []
+        k = min(int(peaks_per_scale), int(np.count_nonzero(finite)))
+        peak_idx = np.argpartition(flat, -k)[-k:]
+        boxes: List[Tuple[float, float, float, float]] = []
+        scores: List[float] = []
+        for linear in peak_idx:
+            s = float(flat[int(linear)])
+            if not np.isfinite(s) or s < score_threshold:
+                continue
+            iy, ix = np.unravel_index(int(linear), heat.shape)
+            boxes.append(
+                _xywh_from_cell(
+                    int(ix) * stride,
+                    int(iy) * stride,
+                    self.win_w,
+                    self.win_h,
+                    self.shrink,
+                    scale=scale,
+                )
+            )
+            scores.append(s)
+        return boxes, scores
+
     def save(self, path: str) -> None:
         with open(path, "wb") as handle:
             pickle.dump(self, handle)
@@ -687,15 +736,19 @@ class BoostedAcf:
             model = pickle.load(handle)
         if not isinstance(model, BoostedAcf):
             raise TypeError(f"expected BoostedAcf, got {type(model)}")
+        if not hasattr(model, "shape"):
+            model.shape = None
+        if not hasattr(model, "min_object_px"):
+            model.min_object_px = 12.0
+        if not hasattr(model, "max_object_px"):
+            model.max_object_px = 220.0
+        if not hasattr(model, "pyramid_step"):
+            model.pyramid_step = 1.09
         return model
 
 
 def colorfulness(bgr: np.ndarray) -> float:
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    mask = np.max(bgr, axis=2) > 20
-    if not np.any(mask):
-        return 0.0
-    return float(np.mean(hsv[:, :, 1][mask]))
+    return image_colorfulness(bgr)
 
 
 def _window_metrics(scores: np.ndarray, y: np.ndarray) -> Dict[str, float]:
@@ -1003,7 +1056,7 @@ def _crop_bgr_padded(
     return crop
 
 
-def window_from_square(
+def window_from_model(
     bgr: np.ndarray,
     box: Sequence[float],
     shrink: int,
@@ -1011,36 +1064,45 @@ def window_from_square(
     win_w: int,
     rng: Optional[np.random.Generator] = None,
     jitter: bool = False,
-    margin_cells: int = 2,
+    margin: float = 0.10,
+    margin_cells: int = 1,
 ) -> Optional[np.ndarray]:
-    """Same window the detector scores: square BGR crop → ACF(shrink) → cells.
+    """Native-aspect crop matching the detector window (no square warp).
 
-    Test-time a pyramid level resizes the frame so an object of size
-    ``side`` fills ``model_px = win * shrink``, then takes a ``win×win``
-    cell slice (no aspect-ratio warp). Training positives/hard-negatives
-    follow that path on a padded square around ``box``.
+    Take a rectangle with aspect ``win_w / win_h`` that covers the GT plate
+    plus ``margin``, resize it to the model pixel size, extract ACF, and
+    slice ``win_h × win_w`` cells from the center.
     """
     _x, _y, w, h = (float(v) for v in box[:4])
     if w < 1.0 or h < 1.0:
         return None
     cx = _x + 0.5 * w
     cy = _y + 0.5 * h
-    side = max(w, h)
+    model_aspect = float(win_w) / max(float(win_h), 1e-6)
+    pad = 1.0 + 2.0 * float(margin)
+    pw, ph = w * pad, h * pad
+    if pw / max(ph, 1e-6) > model_aspect:
+        crop_w = pw
+        crop_h = pw / model_aspect
+    else:
+        crop_h = ph
+        crop_w = ph * model_aspect
     if jitter and rng is not None:
-        side *= float(rng.uniform(0.85, 1.15))
-        cx += float(rng.uniform(-0.12, 0.12)) * side
-        cy += float(rng.uniform(-0.12, 0.12)) * side
-    model_px = int(win_h * shrink)
-    outer_px = int(model_px + 2 * margin_cells * shrink)
-    crop_side = side * (outer_px / float(model_px))
-    x0 = int(round(cx - 0.5 * crop_side))
-    y0 = int(round(cy - 0.5 * crop_side))
-    x1 = x0 + max(1, int(round(crop_side)))
-    y1 = y0 + max(1, int(round(crop_side)))
+        scale = float(rng.uniform(0.85, 1.15))
+        crop_w *= scale
+        crop_h *= scale
+        cx += float(rng.uniform(-0.12, 0.12)) * crop_w
+        cy += float(rng.uniform(-0.12, 0.12)) * crop_h
+    outer_w = int(win_w * shrink + 2 * margin_cells * shrink)
+    outer_h = int(win_h * shrink + 2 * margin_cells * shrink)
+    x0 = int(round(cx - 0.5 * crop_w))
+    y0 = int(round(cy - 0.5 * crop_h))
+    x1 = x0 + max(1, int(round(crop_w)))
+    y1 = y0 + max(1, int(round(crop_h)))
     patch = _crop_bgr_padded(bgr, x0, y0, x1, y1)
     if patch.size == 0:
         return None
-    resized = cv2.resize(patch, (outer_px, outer_px), interpolation=cv2.INTER_LINEAR)
+    resized = cv2.resize(patch, (outer_w, outer_h), interpolation=cv2.INTER_LINEAR)
     agg = extract_acf(resized, shrink=shrink).aggregated
     y_off = max(0, (agg.shape[0] - win_h) // 2)
     x_off = max(0, (agg.shape[1] - win_w) // 2)
@@ -1050,6 +1112,29 @@ def window_from_square(
             return None
         window = resize_patch(window, win_h, win_w)
     return windows_to_features(window).reshape(-1)
+
+
+def window_from_square(
+    bgr: np.ndarray,
+    box: Sequence[float],
+    shrink: int,
+    win_h: int,
+    win_w: int,
+    rng: Optional[np.random.Generator] = None,
+    jitter: bool = False,
+    margin_cells: int = 1,
+) -> Optional[np.ndarray]:
+    """Alias for ``window_from_model`` (kept for older call sites)."""
+    return window_from_model(
+        bgr,
+        box,
+        shrink,
+        win_h,
+        win_w,
+        rng=rng,
+        jitter=jitter,
+        margin_cells=margin_cells,
+    )
 
 
 def cell_window_vec(
@@ -1155,9 +1240,10 @@ def evaluate_detection(
     n_pred = 0
     tp = 0
     ious: List[float] = []
-    kw = dict(return_heat=False, stride=4, score_threshold=0.0)
+    kw = dict(return_heat=False, stride=2, score_threshold=0.0, refine=False)
     kw.update(detect_kw)
     for bgr, anns, _image_id in frames:
+        # Class-agnostic: ignore category_id / logical_* from the loader.
         gt = [ann["bbox"] for ann in anns]
         boxes, _scores, _heat = model.detect_image(bgr, **kw)
         n_gt += len(gt)
@@ -1183,19 +1269,22 @@ def collect_windows(
     win_w: int,
     negatives_per_image: int,
     rng: np.random.Generator,
-    min_box_px: int = 12,
+    min_box_px: int = 8,
     min_color: float = 8.0,
     textured_fraction: float = 0.7,
     jitter_per_gt: int = 1,
+    logical_names: Optional[Sequence[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Positives = canonical squares (same ACF path as detection).
+    """Positives = native-aspect model crops; negatives = cell slices.
 
-    Negatives = exact ``win×win`` cell slices on ``extract_acf(bgr, shrink)``,
-    i.e. scale=1 sliding windows. CLAHE (LAB L) runs once on the full frame
-    before ACF, matching ``detect_image``. Do **not** downsample RGB first.
+    ``logical_names`` restricts positives to those silhouettes (stage-1
+    still does not *score* class labels). Negatives are exact
+    ``win_h×win_w`` slices on ``extract_acf(bgr, shrink)``. CLAHE runs
+    once on the full frame, matching ``detect_image``.
     """
     xs: List[np.ndarray] = []
     ys: List[int] = []
+    allowed = None if logical_names is None else {str(n) for n in logical_names}
     n_textured = int(round(negatives_per_image * textured_fraction))
     n_random = max(0, negatives_per_image - n_textured)
     index_list = [int(i) for i in indices]
@@ -1215,12 +1304,17 @@ def collect_windows(
         bgr = clahe_bgr(bgr)
         acf = extract_acf(bgr, shrink=shrink)
         inv = 1.0 / float(shrink)
+        pos_anns = [
+            ann
+            for ann in anns
+            if allowed is None or str(ann.get("logical_name")) in allowed
+        ]
         gt_cell = [_scale_box(ann["bbox"], inv) for ann in anns]
-        for ann in anns:
+        for ann in pos_anns:
             _x, _y, bw, bh = ann["bbox"]
             if bw < min_box_px or bh < min_box_px:
                 continue
-            vec = window_from_square(
+            vec = window_from_model(
                 bgr, ann["bbox"], shrink, win_h, win_w, rng=rng, jitter=False
             )
             if vec is None:
@@ -1228,7 +1322,7 @@ def collect_windows(
             xs.append(vec)
             ys.append(1)
             for _ in range(int(jitter_per_gt)):
-                jvec = window_from_square(
+                jvec = window_from_model(
                     bgr, ann["bbox"], shrink, win_h, win_w, rng=rng, jitter=True
                 )
                 if jvec is None:
@@ -1262,10 +1356,111 @@ def collect_windows(
                 flush=True,
             )
     if not xs:
-        raise RuntimeError("no training windows (check split / color filter)")
+        raise RuntimeError("no training windows (check split / color filter / shape)")
     x = np.stack(xs, axis=0).astype(np.float32)
     y = np.asarray(ys, dtype=np.float64)
     return x, y
+
+
+def collect_windows_for_shapes(
+    dataset,
+    indices: Iterable[int],
+    shrink: int,
+    shape_windows: Dict[str, Tuple[int, int]],
+    names_by_shape: Dict[str, Sequence[str]],
+    negatives_per_image: int,
+    rng: np.random.Generator,
+    min_box_px: int = 8,
+    min_color: float = 8.0,
+    textured_fraction: float = 0.7,
+    jitter_per_gt: int = 1,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """One full-image ACF pass; positives/negatives are sliced per silhouette."""
+    buckets: Dict[str, Tuple[List[np.ndarray], List[int]]] = {
+        name: ([], []) for name in shape_windows
+    }
+    allowed = {name: {str(n) for n in names} for name, names in names_by_shape.items()}
+    n_textured = int(round(negatives_per_image * textured_fraction))
+    n_random = max(0, negatives_per_image - n_textured)
+    index_list = [int(i) for i in indices]
+    t0 = time.perf_counter()
+    used = 0
+    for step, index in enumerate(index_list, start=1):
+        bgr, anns, _image_id = dataset.get(index)
+        if colorfulness(bgr) < min_color:
+            if step % 100 == 0 or step == len(index_list):
+                print(
+                    f"  collect-all {step}/{len(index_list)}  {time.perf_counter() - t0:.1f}s",
+                    flush=True,
+                )
+            continue
+        bgr = clahe_bgr(bgr)
+        acf = extract_acf(bgr, shrink=shrink)
+        inv = 1.0 / float(shrink)
+        gt_cell = [_scale_box(ann["bbox"], inv) for ann in anns]
+        for shape, (win_w, win_h) in shape_windows.items():
+            xs, ys = buckets[shape]
+            pos_anns = [
+                ann
+                for ann in anns
+                if str(ann.get("logical_name")) in allowed.get(shape, set())
+            ]
+            for ann in pos_anns:
+                _x, _y, bw, bh = ann["bbox"]
+                if bw < min_box_px or bh < min_box_px:
+                    continue
+                vec = window_from_model(
+                    bgr, ann["bbox"], shrink, win_h, win_w, rng=rng, jitter=False
+                )
+                if vec is None:
+                    continue
+                xs.append(vec)
+                ys.append(1)
+                for _ in range(int(jitter_per_gt)):
+                    jvec = window_from_model(
+                        bgr, ann["bbox"], shrink, win_h, win_w, rng=rng, jitter=True
+                    )
+                    if jvec is None:
+                        continue
+                    xs.append(jvec)
+                    ys.append(1)
+            for cx, cy in sample_random_cells(
+                acf.aggregated.shape[:2], gt_cell, win_h, win_w, rng, n_random
+            ):
+                vec = cell_window_vec(acf.aggregated, cx, cy, win_h, win_w)
+                if vec is None:
+                    continue
+                xs.append(vec)
+                ys.append(-1)
+            for cx, cy in sample_textured_cells(
+                acf.aggregated, gt_cell, win_h, win_w, rng, n_textured
+            ):
+                vec = cell_window_vec(acf.aggregated, cx, cy, win_h, win_w)
+                if vec is None:
+                    continue
+                xs.append(vec)
+                ys.append(-1)
+        used += 1
+        if step % 50 == 0 or step == len(index_list):
+            elapsed = time.perf_counter() - t0
+            rate = step / max(elapsed, 1e-6)
+            n_win = sum(len(ys) for _xs, ys in buckets.values())
+            print(
+                f"  collect-all {step}/{len(index_list)}  kept={used}  "
+                f"windows={n_win}  {rate:.1f} img/s",
+                flush=True,
+            )
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for shape, (xs, ys) in buckets.items():
+        if not xs:
+            continue
+        out[shape] = (
+            np.stack(xs, axis=0).astype(np.float32),
+            np.asarray(ys, dtype=np.float64),
+        )
+    if not out:
+        raise RuntimeError("no training windows for any silhouette")
+    return out
 
 
 def hard_negatives(
@@ -1274,7 +1469,7 @@ def hard_negatives(
     indices: Iterable[int],
     per_image: int,
     min_color: float = 8.0,
-    stride: int = 4,
+    stride: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Bootstrap FPs using the same square-crop ACF path as detection."""
     xs: List[np.ndarray] = []
@@ -1282,6 +1477,7 @@ def hard_negatives(
         bgr, anns, _image_id = dataset.get(int(index))
         if colorfulness(bgr) < min_color:
             continue
+        # False positives vs boxes; logical class labels are unused.
         bgr = clahe_bgr(bgr)
         gt = [ann["bbox"] for ann in anns]
         boxes, _scores, _heat = model.detect_image(
@@ -1289,16 +1485,11 @@ def hard_negatives(
             stride=stride,
             score_threshold=0.0,
             score_ratio=0.0,
-            max_boxes=max(per_image * 3, 8),
+            max_boxes=max(per_image * 3, 40),
             return_heat=False,
             refine=False,
             preprocess=False,
-            scales=pyramid_scales(
-                model.win_h * model.shrink,
-                min_object_px=32.0,
-                max_object_px=180.0,
-                step=1.5,
-            ),
+            fast_pyramid=True,
         )
         taken = 0
         for box in boxes:
@@ -1306,7 +1497,7 @@ def hard_negatives(
                 break
             if any(iou(box, g) >= 0.3 for g in gt):
                 continue
-            vec = window_from_square(
+            vec = window_from_model(
                 bgr, box, model.shrink, model.win_h, model.win_w
             )
             if vec is None:
@@ -1318,3 +1509,195 @@ def hard_negatives(
     x = np.stack(xs, axis=0).astype(np.float32)
     y = -np.ones(x.shape[0], dtype=np.float64)
     return x, y
+
+
+def _round_even(value: float, lo: int, hi: int) -> int:
+    rounded = int(round(float(value) / 2.0) * 2)
+    return int(np.clip(rounded, lo, hi))
+
+
+def fit_shape_cell_windows(
+    dataset,
+    shrink: int = 2,
+    target_cells: int = 16,
+    min_cells: int = 10,
+    max_cells: int = 24,
+) -> Tuple[Dict[str, Tuple[int, int]], Dict[str, Tuple[float, float]], Dict[str, int]]:
+    """Per-silhouette ``(win_w, win_h)`` in aggregated cells, plus height range.
+
+    Window aspect is the median GT ``w/h``. Cell counts keep area near
+    ``target_cells²``. Object-size range is the 5th/95th percentile of GT
+    height (the pyramid matches ``win_h * shrink`` to object height).
+    """
+    from shape_detect import CLASS_TO_SHAPE, TEMPLATE_NAMES
+
+    widths: Dict[str, List[float]] = {name: [] for name in TEMPLATE_NAMES}
+    heights: Dict[str, List[float]] = {name: [] for name in TEMPLATE_NAMES}
+    for record in dataset.image_records():
+        for ann in dataset.annotations_for(int(record["id"])):
+            shape = CLASS_TO_SHAPE.get(str(ann["logical_name"]))
+            if shape is None:
+                continue
+            _x, _y, w, h = (float(v) for v in ann["bbox"][:4])
+            widths[shape].append(w)
+            heights[shape].append(h)
+    windows: Dict[str, Tuple[int, int]] = {}
+    object_range: Dict[str, Tuple[float, float]] = {}
+    counts: Dict[str, int] = {}
+    del shrink
+    for name in TEMPLATE_NAMES:
+        ws = np.asarray(widths[name], dtype=np.float64)
+        hs = np.asarray(heights[name], dtype=np.float64)
+        counts[name] = int(hs.size)
+        if hs.size == 0:
+            windows[name] = (int(target_cells), int(target_cells))
+            object_range[name] = (12.0, 220.0)
+            continue
+        aspect = float(np.median(ws / np.maximum(hs, 1e-6)))
+        aspect = float(np.clip(aspect, 0.45, 2.4))
+        win_h = _round_even(float(target_cells) / np.sqrt(aspect), min_cells, max_cells)
+        win_w = _round_even(float(win_h) * aspect, min_cells, max_cells)
+        windows[name] = (int(win_w), int(win_h))
+        lo = max(8.0, float(np.percentile(hs, 5)))
+        hi = max(lo + 8.0, float(np.percentile(hs, 95)))
+        object_range[name] = (lo, hi)
+    return windows, object_range, counts
+
+
+@dataclass
+class AcfBank:
+    """Union of per-silhouette ``BoostedAcf`` detectors, one NMS at the end."""
+
+    models: Dict[str, BoostedAcf] = field(default_factory=dict)
+    windows: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+
+    def detect(
+        self,
+        bgr: np.ndarray,
+        max_boxes: int = 40,
+        stride: int = 2,
+        score_threshold: float = 0.0,
+        nms_iou: float = 0.5,
+        score_ratio: float = 0.0,
+        peaks_per_scale: int = 80,
+        preprocess: bool = True,
+        fast_pyramid: bool = True,
+    ) -> Tuple[List[Tuple[float, float, float, float]], List[float]]:
+        if not self.models:
+            return [], []
+        img = clahe_bgr(bgr) if preprocess else np.asarray(bgr)
+        shrink = int(next(iter(self.models.values())).shrink)
+        scale_keys = sorted(
+            {round(float(s), 4) for model in self.models.values() for s in model.default_scales()},
+            reverse=True,
+        )
+        h0, w0 = img.shape[:2]
+        max_win = max(max(m.win_h, m.win_w) for m in self.models.values())
+        min_side = int(max_win * shrink)
+        base_agg = None
+        if fast_pyramid:
+            base_agg = extract_acf(img, shrink=shrink).aggregated
+        agg_by_scale: Dict[float, np.ndarray] = {}
+        for scale in scale_keys:
+            new_w = max(1, int(round(w0 * scale)))
+            new_h = max(1, int(round(h0 * scale)))
+            if new_w < min_side or new_h < min_side:
+                continue
+            agg_h = max(1, new_h // shrink)
+            agg_w = max(1, new_w // shrink)
+            if fast_pyramid:
+                if abs(scale - 1.0) < 1e-6:
+                    agg_by_scale[float(scale)] = base_agg
+                else:
+                    agg_by_scale[float(scale)] = resize_aggregated(base_agg, agg_h, agg_w)
+            else:
+                if abs(scale - 1.0) < 1e-6:
+                    image = img
+                else:
+                    image = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                agg_by_scale[float(scale)] = extract_acf(image, shrink=shrink).aggregated
+
+        all_boxes: List[Tuple[float, float, float, float]] = []
+        all_scores: List[float] = []
+        for model in self.models.values():
+            for scale in model.default_scales():
+                aggregated = agg_by_scale.get(round(float(scale), 4))
+                if aggregated is None:
+                    continue
+                if aggregated.shape[0] < model.win_h or aggregated.shape[1] < model.win_w:
+                    continue
+                boxes_s, scores_s = model.peaks_on_aggregated(
+                    aggregated,
+                    scale=float(scale),
+                    stride=stride,
+                    score_threshold=score_threshold,
+                    peaks_per_scale=peaks_per_scale,
+                )
+                all_boxes.extend(boxes_s)
+                all_scores.extend(scores_s)
+
+        keep = nms(all_boxes, all_scores, iou_threshold=float(nms_iou))
+        boxes = [all_boxes[i] for i in keep]
+        scores = [all_scores[i] for i in keep]
+        if not scores:
+            return [], []
+        cutoff = float(score_threshold)
+        if score_ratio > 0.0:
+            cutoff = max(cutoff, float(score_ratio) * max(scores))
+        filtered = [(b, s) for b, s in zip(boxes, scores) if s >= cutoff]
+        filtered = filtered[: max(1, int(max_boxes))]
+        return [b for b, _s in filtered], [s for _b, s in filtered]
+
+    def propose(
+        self,
+        bgr: np.ndarray,
+        max_boxes: int = 40,
+        **detect_kw: Any,
+    ) -> Tuple[List[Tuple[float, float, float, float]], List[float]]:
+        return self.detect(bgr, max_boxes=int(max_boxes), **detect_kw)
+
+    def detect_image(
+        self,
+        bgr: np.ndarray,
+        max_boxes: int = 40,
+        return_heat: bool = False,
+        **detect_kw: Any,
+    ) -> Tuple[List[Tuple[float, float, float, float]], List[float], np.ndarray]:
+        """Same boxes as ``detect``; heat is empty (bank has several maps)."""
+        detect_kw.pop("refine", None)
+        detect_kw.pop("fast_pyramid", None)
+        detect_kw.pop("scales", None)
+        boxes, scores = self.detect(bgr, max_boxes=int(max_boxes), **detect_kw)
+        heat = np.zeros((bgr.shape[0], bgr.shape[1]), dtype=np.float32)
+        del return_heat
+        return boxes, scores, heat
+
+    def save(self, path: str) -> None:
+        with open(path, "wb") as handle:
+            pickle.dump(self, handle)
+
+    @staticmethod
+    def load(path: str) -> "AcfBank":
+        with open(path, "rb") as handle:
+            bank = pickle.load(handle)
+        if not isinstance(bank, AcfBank):
+            raise TypeError(f"expected AcfBank, got {type(bank)}")
+        for model in bank.models.values():
+            if not hasattr(model, "min_object_px"):
+                model.min_object_px = 12.0
+            if not hasattr(model, "max_object_px"):
+                model.max_object_px = 220.0
+            if not hasattr(model, "pyramid_step"):
+                model.pyramid_step = 1.09
+        return bank
+
+
+def load_acf_stage(path: str) -> Union[AcfBank, BoostedAcf]:
+    """Load ``AcfBank`` or a legacy single ``BoostedAcf``."""
+    with open(path, "rb") as handle:
+        obj = pickle.load(handle)
+    if isinstance(obj, AcfBank):
+        return AcfBank.load(path)
+    if isinstance(obj, BoostedAcf):
+        return BoostedAcf.load(path)
+    raise TypeError(f"expected AcfBank or BoostedAcf, got {type(obj)}")
